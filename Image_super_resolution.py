@@ -1,1 +1,154 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.10.14","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"gpu","dataSources":[{"sourceId":9385327,"sourceType":"datasetVersion","datasetId":5694272},{"sourceId":9385580,"sourceType":"datasetVersion","datasetId":5694455}],"dockerImageVersionId":30761,"isInternetEnabled":true,"language":"python","sourceType":"script","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"# %% [code] {\"execution\":{\"iopub.status.busy\":\"2024-09-13T19:14:29.548643Z\",\"iopub.execute_input\":\"2024-09-13T19:14:29.549001Z\",\"iopub.status.idle\":\"2024-09-13T21:57:46.610032Z\",\"shell.execute_reply.started\":\"2024-09-13T19:14:29.548938Z\",\"shell.execute_reply\":\"2024-09-13T21:57:46.609102Z\"}}\nimport os\nimport argparse\nimport torch\nimport torch.nn as nn\nimport torch.optim as optim\nfrom torch.utils.data import DataLoader, Dataset\nfrom torchvision import transforms\nfrom PIL import Image\nfrom tqdm import tqdm\nimport matplotlib.pyplot as plt\n\n# Define the Generator model\nclass Generator(nn.Module):\n    def __init__(self):\n        super(Generator, self).__init__()\n        self.main = nn.Sequential(\n            nn.Conv2d(3, 64, kernel_size=9, stride=1, padding=4),\n            nn.PReLU(),\n            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),\n            nn.PReLU(),\n            nn.Conv2d(64, 3, kernel_size=9, stride=1, padding=4),\n            nn.Tanh()\n        )\n\n    def forward(self, x):\n        return self.main(x)\n\n# Define the Discriminator model\nclass Discriminator(nn.Module):\n    def __init__(self):\n        super(Discriminator, self).__init__()\n        self.main = nn.Sequential(\n            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),\n            nn.LeakyReLU(0.2, inplace=True),\n            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),\n            nn.BatchNorm2d(128),\n            nn.LeakyReLU(0.2, inplace=True),\n            nn.Flatten(),\n            nn.Linear(128 * 48 * 48, 1024),\n            nn.LeakyReLU(0.2, inplace=True),\n            nn.Linear(1024, 1),\n            nn.Sigmoid()\n        )\n\n    def forward(self, x):\n        return self.main(x)\n\n# Dataset class for SRGAN\nclass SRGANDataset(Dataset):\n    def __init__(self, hr_path, lr_path, transform=None):\n        self.hr_path = hr_path\n        self.lr_path = lr_path\n        self.transform = transform\n        self.hr_images = sorted(os.listdir(hr_path))\n        self.lr_images = sorted(os.listdir(lr_path))\n\n    def __len__(self):\n        return len(self.hr_images)\n\n    def __getitem__(self, index):\n        hr_img = Image.open(os.path.join(self.hr_path, self.hr_images[index]))\n        lr_img = Image.open(os.path.join(self.lr_path, self.lr_images[index]))\n        \n        if self.transform:\n            hr_img = self.transform(hr_img)\n            lr_img = self.transform(lr_img)\n        \n        return lr_img, hr_img\n\n# Arguments for path \nclass Args:\n    epochs = 100\n    batch_size = 16\n    lr = 0.0002\n    hr_path = \"/home/input/div2k-train-hr-dataset/DIV2K_train_HR\"  \n    lr_path = \"/home/input/div2k-train-lr-bicubic/home/tanmay.somkuwar/implementation/chatbot/DIV2K_train_LR_bicubic\"  \n    device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n\nargs = Args()\n\n# Image preprocessing transformations\ntransform = transforms.Compose([\n    transforms.Resize((96, 96)),  \n    transforms.ToTensor(),\n    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])\n])\n\n# Prepare datasets and dataloaders\ntrain_dataset = SRGANDataset(args.hr_path, args.lr_path, transform=transform)\ntrain_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True)\n\n# Initialize generator and discriminator\ngenerator = Generator().to(args.device)\ndiscriminator = Discriminator().to(args.device)\n\n# Define loss functions and optimizers\ncriterion_GAN = nn.BCELoss().to(args.device)  # Binary Cross Entropy Loss for Discriminator\ncriterion_content = nn.MSELoss().to(args.device)  # MSE Loss for content\noptimizer_G = optim.Adam(generator.parameters(), lr=args.lr)\noptimizer_D = optim.Adam(discriminator.parameters(), lr=args.lr)\n\n# Training Loop\ng_losses, d_losses = [], []\n\nfor epoch in range(args.epochs):\n    generator.train()\n    discriminator.train()\n    \n    g_loss_total, d_loss_total = 0, 0\n\n    for i, (lr_imgs, hr_imgs) in enumerate(tqdm(train_loader)):\n        lr_imgs, hr_imgs = lr_imgs.to(args.device), hr_imgs.to(args.device)\n        \n        # Generate high-resolution images from low-resolution inputs\n        fake_hr_imgs = generator(lr_imgs)\n\n        # Train Discriminator\n        optimizer_D.zero_grad()\n        real_loss = criterion_GAN(discriminator(hr_imgs), torch.ones_like(discriminator(hr_imgs)))\n        fake_loss = criterion_GAN(discriminator(fake_hr_imgs.detach()), torch.zeros_like(discriminator(fake_hr_imgs.detach())))\n        d_loss = (real_loss + fake_loss) / 2\n        d_loss.backward()\n        optimizer_D.step()\n\n        # Train Generator\n        optimizer_G.zero_grad()\n        gan_loss = criterion_GAN(discriminator(fake_hr_imgs), torch.ones_like(discriminator(fake_hr_imgs)))\n        content_loss = criterion_content(fake_hr_imgs, hr_imgs)\n        g_loss = content_loss + 1e-3 * gan_loss  # Combined generator loss\n        g_loss.backward()\n        optimizer_G.step()\n\n        g_loss_total += g_loss.item()\n        d_loss_total += d_loss.item()\n    \n    # Record losses\n    g_losses.append(g_loss_total / len(train_loader))\n    d_losses.append(d_loss_total / len(train_loader))\n    \n    print(f\"Epoch [{epoch+1}/{args.epochs}]  Generator Loss: {g_losses[-1]:.4f}  Discriminator Loss: {d_losses[-1]:.4f}\")\n\n# Save the model weights after training\ntorch.save(generator.state_dict(), \"generator.pth\")\ntorch.save(discriminator.state_dict(), \"discriminator.pth\")\n\n# Plot training losses\nplt.figure(figsize=(10,5))\nplt.title(\"Generator and Discriminator Loss During Training\")\nplt.plot(g_losses, label=\"G\")\nplt.plot(d_losses, label=\"D\")\nplt.xlabel(\"Epochs\")\nplt.ylabel(\"Loss\")\nplt.legend()\nplt.show()\n\n\n# %% [code]\n","metadata":{"_uuid":"8a62df0d-132d-4270-947c-235d6044672f","_cell_guid":"2d8fa6e4-1565-4ab8-ad38-81e4b98b85ed","collapsed":false,"jupyter":{"outputs_hidden":false},"trusted":true},"execution_count":null,"outputs":[]}]}
+import os
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# Define the Generator model
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=9, stride=1, padding=4),
+            nn.PReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.PReLU(),
+            nn.Conv2d(64, 3, kernel_size=9, stride=1, padding=4),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+# Define the Discriminator model
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten(),
+            nn.Linear(128 * 48 * 48, 1024),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(1024, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+# Dataset class for SRGAN
+class SRGANDataset(Dataset):
+    def __init__(self, hr_path, lr_path, transform=None):
+        self.hr_path = hr_path
+        self.lr_path = lr_path
+        self.transform = transform
+        self.hr_images = sorted(os.listdir(hr_path))
+        self.lr_images = sorted(os.listdir(lr_path))
+
+    def __len__(self):
+        return len(self.hr_images)
+
+    def __getitem__(self, index):
+        hr_img = Image.open(os.path.join(self.hr_path, self.hr_images[index]))
+        lr_img = Image.open(os.path.join(self.lr_path, self.lr_images[index]))
+
+        if self.transform:
+            hr_img = self.transform(hr_img)
+            lr_img = self.transform(lr_img)
+
+        return lr_img, hr_img
+
+# Arguments for path
+class Args:
+    epochs = 100
+    batch_size = 16
+    lr = 0.0002
+    hr_path = "/home/input/div2k-train-hr-dataset/DIV2K_train_HR"
+    lr_path = "/home/input/div2k-train-lr-bicubic/home/tanmay.somkuwar/implementation/chatbot/DIV2K_train_LR_bicubic"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+args = Args()
+
+# Image preprocessing transformations
+transform = transforms.Compose([
+    transforms.Resize((96, 96)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+# Prepare datasets and dataloaders
+train_dataset = SRGANDataset(args.hr_path, args.lr_path, transform=transform)
+train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True)
+
+# Initialize generator and discriminator
+generator = Generator().to(args.device)
+discriminator = Discriminator().to(args.device)
+
+# Define loss functions and optimizers
+criterion_GAN = nn.BCELoss().to(args.device)  # Binary Cross Entropy Loss for Discriminator
+criterion_content = nn.MSELoss().to(args.device)  # MSE Loss for content
+optimizer_G = optim.Adam(generator.parameters(), lr=args.lr)
+optimizer_D = optim.Adam(discriminator.parameters(), lr=args.lr)
+
+# Training Loop
+g_losses, d_losses = [], []
+
+for epoch in range(args.epochs):
+    generator.train()
+    discriminator.train()
+
+    g_loss_total, d_loss_total = 0, 0
+
+    for i, (lr_imgs, hr_imgs) in enumerate(tqdm(train_loader)):
+        lr_imgs, hr_imgs = lr_imgs.to(args.device), hr_imgs.to(args.device)
+
+        # Generate high-resolution images from low-resolution inputs
+        fake_hr_imgs = generator(lr_imgs)
+
+        # Train Discriminator
+        optimizer_D.zero_grad()
+        real_loss = criterion_GAN(discriminator(hr_imgs), torch.ones_like(discriminator(hr_imgs)))
+        fake_loss = criterion_GAN(discriminator(fake_hr_imgs.detach()), torch.zeros_like(discriminator(fake_hr_imgs.detach())))
+        d_loss = (real_loss + fake_loss) / 2
+        d_loss.backward()
+        optimizer_D.step()
+
+        # Train Generator
+        optimizer_G.zero_grad()
+        gan_loss = criterion_GAN(discriminator(fake_hr_imgs), torch.ones_like(discriminator(fake_hr_imgs)))
+        content_loss = criterion_content(fake_hr_imgs, hr_imgs)
+        g_loss = content_loss + 1e-3 * gan_loss  # Combined generator loss
+        g_loss.backward()
+        optimizer_G.step()
+
+        g_loss_total += g_loss.item()
+        d_loss_total += d_loss.item()
+
+    # Record losses
+    g_losses.append(g_loss_total / len(train_loader))
+    d_losses.append(d_loss_total / len(train_loader))
+
+    print(f"Epoch [{epoch+1}/{args.epochs}]  Generator Loss: {g_losses[-1]:.4f}  Discriminator Loss: {d_losses[-1]:.4f}")
+
+# Save the model weights after training
+torch.save(generator.state_dict(), "generator.pth")
+torch.save(discriminator.state_dict(), "discriminator.pth")
+
+# Plot training losses
+plt.figure(figsize=(10,5))
+plt.title("Generator and Discriminator Loss During Training")
+plt.plot(g_losses, label="G")
+plt.plot(d_losses, label="D")
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.legend()
+plt.show()
